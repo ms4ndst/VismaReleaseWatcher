@@ -5,10 +5,12 @@ param(
 )
 
 # Visma Release Watcher - Background tray app
-# - Checks https://releasenotes.control.visma.com/ twice a day
+# - Checks https://releasenotes.control.visma.com/ twice a day using the WordPress REST API
+# - Uses ETag (If-None-Match) to avoid unnecessary downloads; detects both new and edited posts
 # - Tray icon: green = no updates, yellow = updates detected since last check
 # - Settings GUI to set two daily check times (HH:mm, 24-hour)
 # - Logs checks to CSV under ProgramData
+# - Config persists LastSignature, LastLinks, LastChecked, and ApiETag
 
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
@@ -52,13 +54,24 @@ function Save-Config($config) {
 
 function Load-Config() {
     if (Test-Path $ConfigPath) {
-        try { return (Get-Content -Path $ConfigPath -Raw | ConvertFrom-Json) } catch {}
+        try {
+            $cfg = Get-Content -Path $ConfigPath -Raw | ConvertFrom-Json
+            if (-not ($cfg.PSObject.Properties.Name -contains 'LastLinks')) {
+                $cfg | Add-Member -NotePropertyName LastLinks -NotePropertyValue @()
+            }
+            if (-not ($cfg.PSObject.Properties.Name -contains 'ApiETag')) {
+                $cfg | Add-Member -NotePropertyName ApiETag -NotePropertyValue ''
+            }
+            return $cfg
+        } catch {}
     }
     # Default config
     return [pscustomobject]@{
         CheckTimes    = @('09:00','15:00')  # 24h format HH:mm
         LastSignature = ''
         LastChecked   = ''
+        LastLinks     = @()
+        ApiETag       = ''
     }
 }
 
@@ -144,36 +157,102 @@ function Get-Signature([string]$text){
     -join ($hash | ForEach-Object { $_.ToString('x2') })
 }
 
+function Get-LinksSignature($linksSet){
+    # Build a stable signature from the set of links only (avoids dynamic HTML noise)
+    $arr = @($linksSet)
+    $sorted = $arr | Sort-Object -Unique
+    $joined = [string]::Join("`n", $sorted)
+    return Get-Signature $joined
+}
+
+# Check-ForUpdates
+# - Queries WP REST: /wp-json/wp/v2/posts?per_page=25&_fields=id,link,modified_gmt
+# - Sends If-None-Match with persisted ApiETag; if 304 -> no change
+# - Computes signature from sorted lines of "id|modified_gmt|link" to capture edits as well
+# - Only notifies as UpdateDetected when new links appear vs. the previous snapshot (consistent with prior behavior)
 function Check-ForUpdates {
     param([switch]$Interactive)
     try {
-        $url = 'https://releasenotes.control.visma.com/'
-        $resp = Invoke-WebRequest -Uri $url -TimeoutSec 30 -Headers @{ 'User-Agent' = 'VismaReleaseWatcher/1.0 (+PowerShell)' }
-        $html = $resp.Content
-        $sig = Get-Signature $html
-        $links = Get-Links $html
+        $restUrl = 'https://releasenotes.control.visma.com/wp-json/wp/v2/posts?per_page=25&_fields=id,link,modified_gmt'
+        $headers = @{ 'User-Agent' = 'VismaReleaseWatcher/1.1 (+PowerShell)' }
+        if ($config.PSObject.Properties.Name -notcontains 'ApiETag') {
+            $config | Add-Member -NotePropertyName ApiETag -NotePropertyValue ''
+        }
+        if ($config.ApiETag) { $headers['If-None-Match'] = $config.ApiETag }
 
-        $prevSig = $config.LastSignature
-        $hasUpdate = $false
-        $newCount = 0
-        if ($prevSig) {
-            if ($sig -ne $prevSig) {
-                $hasUpdate = $true
-                # Not tracking previous link set; record 1 as a signal of change
-                $newCount = 1
+        $resp = $null
+        $status = 200
+        try {
+            $resp = Invoke-WebRequest -Uri $restUrl -TimeoutSec 30 -Headers $headers -ErrorAction Stop
+            $status = $resp.StatusCode
+        } catch {
+            $we = $_.Exception
+            if ($we -and $we.Response -and ($we.Response.StatusCode.value__ -eq 304)) {
+                $status = 304
+            } else {
+                throw
             }
-        } else {
-            # First run establishes baseline
+        }
+
+        $sig = $config.LastSignature
+        $links = $config.LastLinks
+        $newCount = 0
+        $hasUpdate = $false
+
+        if ($status -eq 304) {
+            # No change on server since previous ETag
             $hasUpdate = $false
+        } else {
+            # Update ETag if present
+            try {
+                $etag = $resp.Headers.ETag
+                if ($etag) { $config.ApiETag = $etag }
+            } catch {}
+
+            # Parse JSON and compute signature from id|modified_gmt|link
+            $json = $resp.Content | ConvertFrom-Json
+            $rows = @()
+            $currLinks = @()
+            foreach ($p in $json) {
+                $rows += ('{0}|{1}|{2}' -f $p.id, $p.modified_gmt, $p.link)
+                $currLinks += $p.link
+            }
+            $sorted = $rows | Sort-Object
+            $joined = [string]::Join("`n", $sorted)
+            $sig = Get-Signature $joined
+
+            $prevSig = $config.LastSignature
+            $prevLinks = @()
+            if ($config.PSObject.Properties.Name -contains 'LastLinks') { $prevLinks = @($config.LastLinks) }
+
+            if ($prevSig) {
+                if ($sig -ne $prevSig) {
+                    # Compute actually new posts compared to last snapshot (by link)
+                    $newLinks = @()
+                    foreach ($l in $currLinks) { if (-not ($prevLinks -contains $l)) { $newLinks += $l } }
+                    $newCount = $newLinks.Count
+                    $hasUpdate = ($newCount -gt 0)
+                }
+            } else {
+                # First run establishes baseline only (no update)
+                $hasUpdate = $false
+            }
+
+            # Persist current snapshot
+            $links = $currLinks
         }
 
         $config.LastSignature = $sig
+        if (-not ($config.PSObject.Properties.Name -contains 'LastLinks')) {
+            $config | Add-Member -NotePropertyName LastLinks -NotePropertyValue @()
+        }
+        $config.LastLinks = @($links)
         $config.LastChecked = (Get-Date).ToString('o')
         Save-Config $config
 
-        $status = if ($hasUpdate) { 'UpdateDetected' } else { 'NoChange' }
-        "$([DateTime]::Now.ToString('s')),$status,$newCount,$sig" | Add-Content -Encoding UTF8 -Path $CsvPath
-        Write-Log "Check completed. Status=$status NextDue=$((Get-NextDue).ToString('s'))"
+        $statusText = if ($hasUpdate) { 'UpdateDetected' } else { 'NoChange' }
+        "$([DateTime]::Now.ToString('s')),$statusText,$newCount,$sig" | Add-Content -Encoding UTF8 -Path $CsvPath
+        Write-Log "Check completed. Status=$statusText NextDue=$((Get-NextDue).ToString('s'))"
 
         if ($hasUpdate) {
             if ($script:notify) {
@@ -263,16 +342,16 @@ function Schedule-Next {
     if ($script:winTimer) { $script:winTimer.Stop(); $script:winTimer.Dispose(); $script:winTimer = $null }
     $due = Get-NextDue
     $now = Get-Date
-    $ms = [int][Math]::Max(1000, ($due - $now).TotalMilliseconds)
+    $script:schedMs = [int][Math]::Max(1000, ($due - $now).TotalMilliseconds)
 
     # Use a WinForms timer to fire on the UI thread to avoid cross-thread exceptions
     $script:winTimer = New-Object System.Windows.Forms.Timer
-    $script:winTimer.Interval = [Math]::Min($ms, [int][uint16]::MaxValue)  # cap to ~65s; reschedule if needed
+    $script:winTimer.Interval = [Math]::Min($script:schedMs, [int][uint16]::MaxValue)  # cap to ~65s; reschedule if needed
 
-    $elapsed = 0
+    $script:schedElapsed = 0
     $tick = {
-        $elapsed += $script:winTimer.Interval
-        if ($elapsed -ge $ms) {
+        $script:schedElapsed += $script:winTimer.Interval
+        if ($script:schedElapsed -ge $script:schedMs) {
             $script:winTimer.Stop()
             try { Check-ForUpdates } finally { Schedule-Next }
         }
@@ -378,9 +457,8 @@ if (-not $CheckNow) {
     $script:notify.add_BalloonTipClicked({ Write-Log 'Balloon clicked'; Show-Settings })
     $script:notify.add_BalloonTipClosed({ Write-Log 'Balloon closed' })
 
-    # Start scheduling and do an initial check
+    # Start scheduling (no immediate check to avoid out-of-schedule notifications)
     Schedule-Next
-    Check-ForUpdates
 
 # Create an invisible host form to keep the message loop alive reliably
 $script:hostForm = New-Object System.Windows.Forms.Form

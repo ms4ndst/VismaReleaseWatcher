@@ -1,10 +1,10 @@
 # Visma Release Watcher
 
-A small PowerShell tray application that checks https://releasenotes.control.visma.com/ twice a day and indicates status via a system tray icon:
+A small PowerShell tray application that checks https://releasenotes.control.visma.com/ twice a day via the WordPress REST API and indicates status via a system tray icon:
 - Green = no change since last check
 - Yellow = new updates detected since last check
 
-Checks and results are logged to CSV and settings are persisted in ProgramData.
+It uses ETag (If-None-Match) to avoid unnecessary downloads and computes a stable signature from post id + modified time, so edits to existing posts are detected. Checks and results are logged to CSV and settings are persisted in ProgramData.
 
 ## Install
 
@@ -53,7 +53,7 @@ First run establishes a baseline signature and will typically show green until c
 
 ## Data and Logs
 
-- Config: C:\\ProgramData\\VismaReleaseWatcher\\config.json
+- Config: C:\\ProgramData\\VismaReleaseWatcher\\config.json (includes CheckTimes, LastSignature, LastChecked, LastLinks, ApiETag)
 - CSV log: C:\\ProgramData\\VismaReleaseWatcher\\updates.csv
 - App log: C:\\ProgramData\\VismaReleaseWatcher\\app.log
 - Watchdog log: C:\\ProgramData\\VismaReleaseWatcher\\watchdog.log
@@ -65,12 +65,14 @@ CSV columns: Timestamp, Status (NoChange|UpdateDetected), NewLinksCount, Signatu
 - Tray icon not visible: click the taskbar up-arrow to show hidden icons and drag the icon to pin it.
 - Icon disappeared: it should be recreated automatically; if not, right-click > Restart.
 - A console window appears: the launcher uses wscript + powershell.exe hidden. If you still see a console, ensure no duplicate Startup entries exist that run pwsh.exe directly.
+- If updates never appear but the site clearly changed: check app.log for "304 Not Modified" behavior; you can delete the ApiETag field in config.json to force a full refresh on the next check.
 - Manual start: run the tray app once in the foreground for diagnostics:
 
   pwsh -NoProfile -STA -ExecutionPolicy Bypass -File "C:\\ProgramData\\VismaReleaseWatcher\\VismaReleaseWatcher.ps1" -ShowBalloon
 
 ## Notes
 
+- Change detection uses the WordPress REST API endpoint /wp-json/wp/v2/posts with ETag caching. Edits to posts change the signature; new posts trigger a yellow notification.
 - Requires Windows with .NET Windows Forms available (PowerShell 7+ or Windows PowerShell is fine; launcher uses Windows PowerShell for hidden startup).
 - The app dynamically draws the tray icons; no .ico files are required.
 - Network errors are shown as a tray balloon but do not stop the app.
