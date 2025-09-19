@@ -161,7 +161,7 @@ function Get-LinksSignature($linksSet){
     # Build a stable signature from the set of links only (avoids dynamic HTML noise)
     $arr = @($linksSet)
     $sorted = $arr | Sort-Object -Unique
-    $joined = [string]::Join("`n", $sorted)
+    $joined = @($sorted) -join "`n"
     return Get-Signature $joined
 }
 
@@ -218,7 +218,7 @@ function Check-ForUpdates {
                 $currLinks += $p.link
             }
             $sorted = $rows | Sort-Object
-            $joined = [string]::Join("`n", $sorted)
+            $joined = @($sorted) -join "`n"
             $sig = Get-Signature $joined
 
             $prevSig = $config.LastSignature
